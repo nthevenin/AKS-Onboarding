@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- workloads_v1_partitionedworkload.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

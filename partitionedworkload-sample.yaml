@@ -1,0 +1,12 @@
+apiVersion: workloads.example.com/v1
+kind: PartitionedWorkload
+metadata:
+  name: my-workload
+  namespace: custom-resource-def-system
+spec:
+  replicas: 5
+  podTemplate:
+    containers:
+    - name: nginx
+      image: nginx:1.19
+  partitionCount: 0

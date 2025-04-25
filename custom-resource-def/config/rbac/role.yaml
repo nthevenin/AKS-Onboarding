@@ -1,0 +1,44 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - workloads.example.com
+  resources:
+  - partitionedworkloads
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - workloads.example.com
+  resources:
+  - partitionedworkloads/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - workloads.example.com
+  resources:
+  - partitionedworkloads/status
+  verbs:
+  - get
+  - patch
+  - update
+# Add permissions for Pods
+- apiGroups: [""]
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - delete
+  - patch

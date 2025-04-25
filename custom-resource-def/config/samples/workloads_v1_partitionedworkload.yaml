@@ -1,0 +1,9 @@
+apiVersion: workloads.example.com/v1
+kind: PartitionedWorkload
+metadata:
+  labels:
+    app.kubernetes.io/name: custom-resource-def
+    app.kubernetes.io/managed-by: kustomize
+  name: partitionedworkload-sample
+spec:
+  # TODO(user): Add fields here
