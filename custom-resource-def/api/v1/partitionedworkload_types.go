@@ -30,11 +30,10 @@ type PodTemplateSpec struct {
 
 // PartitionedWorkloadStatus defines the observed state of PartitionedWorkload
 type PartitionedWorkloadStatus struct {
-	// Number of available replicas
-	AvailableReplicas int32 `json:"availableReplicas"`
-
-	// Number of replicas being upgraded
-	UpgradingReplicas int32 `json:"upgradingReplicas"`
+	AvailableReplicas int32  `json:"availableReplicas"`
+	UpgradingReplicas int32  `json:"upgradingReplicas"`
+	ReferenceVersion  string `json:"referenceVersion"`
+	Version           string `json:"version"`
 }
 
 // +kubebuilder:object:root=true
