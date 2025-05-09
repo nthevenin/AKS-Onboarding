@@ -8,5 +8,5 @@ spec:
   podTemplate:
     containers:
     - name: nginx
-      image: nginx:1.21
-  partitionCount: 3
+      image: nginx:1.20
+  partitionCount: 4

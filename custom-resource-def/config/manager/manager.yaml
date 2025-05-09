@@ -63,7 +63,7 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
-        image: nthevenin/custom-resource-controller:latest
+        image: nthevenin/custom-resource-controller:1.16
         imagePullPolicy: IfNotPresent
         name: manager
         ports: []
