@@ -4,9 +4,9 @@ metadata:
   name: my-workload
   namespace: custom-resource-def-system
 spec:
-  replicas: 5
+  replicas: 4
   podTemplate:
     containers:
     - name: nginx
-      image: nginx:1.20
-  partitionCount: 4
+      image: nginx:1.19
+  partitionCount: 0

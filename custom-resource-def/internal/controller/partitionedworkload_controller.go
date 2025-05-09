@@ -1,12 +1,15 @@
 package controller
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"sort"
+	"time"
 
 	workloadsv1 "github.com/nthevenin/custom-workload-operator/api/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,9 +46,6 @@ func (r *PartitionedWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.
 	}
 	log.Info("Successfully fetched PartitionedWorkload resource", "name", workload.Name)
 
-	// Generate the current pod-template-hash for the workload's PodTemplateSpec
-	currentHash := generatePodTemplateHash(workload.Spec.PodTemplate)
-
 	// List all Pods managed by this PartitionedWorkload
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(req.Namespace), client.MatchingLabels{
@@ -58,7 +58,7 @@ func (r *PartitionedWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.
 
 	// Ensure the desired number of Pods and partitioning
 	log.Info("Ensuring desired number of Pods and partitioning")
-	if err := r.ensureReplicasAndPartition(ctx, &workload, &pods, currentHash); err != nil {
+	if err := r.ensureReplicasAndPartition(ctx, &workload, &pods); err != nil {
 		log.Error(err, "Failed to ensure replicas and partitioning")
 		return ctrl.Result{}, err
 	}
@@ -76,98 +76,160 @@ func (r *PartitionedWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.
 	return ctrl.Result{}, nil
 }
 
-func (r *PartitionedWorkloadReconciler) ensureReplicasAndPartition(ctx context.Context, workload *workloadsv1.PartitionedWorkload, pods *corev1.PodList, currentHash string) error {
+func (r *PartitionedWorkloadReconciler) ensureReplicasAndPartition(ctx context.Context, workload *workloadsv1.PartitionedWorkload, pods *corev1.PodList) error {
 	log := logf.FromContext(ctx)
-	log.Info("Ensuring replicas and partitioning", "desiredReplicas", workload.Spec.Replicas, "partitionCount", workload.Spec.PartitionCount, "currentHash", currentHash)
 
-	// Separate pods into old (by previous hash) and new (by current hash)
-	var oldPods, newPods []corev1.Pod
-	for _, pod := range pods.Items {
-		if pod.DeletionTimestamp != nil {
-			log.Info("Skipping terminating Pod", "podName", pod.Name)
-			continue
-		}
-		if pod.Labels["pod-template-hash"] == currentHash {
-			newPods = append(newPods, pod)
-		} else {
-			oldPods = append(oldPods, pod)
+	// Step 1: List existing ControllerRevisions
+	var revisions appsv1.ControllerRevisionList
+	if err := r.List(ctx, &revisions, client.InNamespace(workload.Namespace), client.MatchingLabels{
+		"partitionedworkload": workload.Name,
+	}); err != nil {
+		log.Error(err, "Failed to list ControllerRevisions")
+		return err
+	}
+
+	// Step 2: Sort and categorize ControllerRevisions
+	sort.Slice(revisions.Items, func(i, j int) bool {
+		return revisions.Items[i].Revision < revisions.Items[j].Revision
+	})
+
+	log.Info("Listed ControllerRevisions", "revisionCount", len(revisions.Items))
+	for _, rev := range revisions.Items {
+		log.Info("ControllerRevision", "name", rev.Name, "revision", rev.Revision)
+	}
+
+	// Identify the current and previous revisions
+	var currentRevision *appsv1.ControllerRevision
+	var oldRevisions []*appsv1.ControllerRevision
+
+	if len(revisions.Items) > 0 {
+		currentRevision = &revisions.Items[len(revisions.Items)-1] // Most recent revision
+
+		// Convert []appsv1.ControllerRevision to []*appsv1.ControllerRevision
+		for i := 0; i < len(revisions.Items)-1; i++ {
+			oldRevisions = append(oldRevisions, &revisions.Items[i])
 		}
 	}
-	log.Info("Categorized pods by pod-template-hash", "oldPodsCount", len(oldPods), "newPodsCount", len(newPods))
 
-	// Calculate desired counts
+	log.Info("Identified revisions", "currentRevision", currentRevision.Name, "oldRevisionCount", len(oldRevisions))
+	// Step 3: Create a new ControllerRevision if the PodTemplateSpec has changed
+	serializedTemplate, err := json.Marshal(workload.Spec.PodTemplate)
+	if err != nil {
+		log.Error(err, "Failed to serialize PodTemplateSpec")
+		return err
+	}
+	if currentRevision == nil || !bytes.Equal(currentRevision.Data.Raw, serializedTemplate) {
+		newRevision := &appsv1.ControllerRevision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("%s-%d", workload.Name, time.Now().UnixNano()),
+				Namespace: workload.Namespace,
+				Labels: map[string]string{
+					"partitionedworkload": workload.Name,
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					*metav1.NewControllerRef(workload, workloadsv1.GroupVersion.WithKind("PartitionedWorkload")),
+				},
+			},
+			Data: runtime.RawExtension{
+				Raw: serializedTemplate,
+			},
+			Revision: func() int64 {
+				if currentRevision != nil {
+					return currentRevision.Revision + 1
+				}
+				return 1
+			}(),
+		}
+		if err := r.Create(ctx, newRevision); err != nil {
+			log.Error(err, "Failed to create ControllerRevision")
+			return err
+		}
+		currentRevision = newRevision
+		log.Info("Created new ControllerRevision", "revision", currentRevision.Revision)
+	}
+
+	// Step 4: Categorize Pods by revision
+	var oldPods, newPods []corev1.Pod
+	for _, pod := range pods.Items {
+		if pod.Labels["controller-revision-hash"] == currentRevision.Name {
+			newPods = append(newPods, pod)
+		} else {
+			for _, oldRev := range oldRevisions {
+				if pod.Labels["controller-revision-hash"] == oldRev.Name {
+					oldPods = append(oldPods, pod)
+					break
+				}
+			}
+		}
+	}
+	log.Info("Categorized pods by ControllerRevision", "oldPodsCount", len(oldPods), "newPodsCount", len(newPods))
+
+	// Step 5: Calculate desired counts
 	desiredOldPods := workload.Spec.PartitionCount
 	desiredNewPods := workload.Spec.Replicas - desiredOldPods
 	log.Info("Calculated desired pod counts", "desiredOldPods", desiredOldPods, "desiredNewPods", desiredNewPods)
 
-	// Create a reconciliation plan
+	// Step 6: Reconciliation plan
 	var podsToDelete []corev1.Pod
 	podsToCreate := 0
 
-	// Delete excess old pods if there are more than desiredOldPods
+	// Retain the desired number of old Pods
 	if len(oldPods) > int(desiredOldPods) {
 		podsToDelete = append(podsToDelete, oldPods[int(desiredOldPods):]...)
 		oldPods = oldPods[:int(desiredOldPods)]
 	}
 
-	// Delete excess new pods if there are more than desiredNewPods
+	// Delete excess new Pods
 	if len(newPods) > int(desiredNewPods) {
 		podsToDelete = append(podsToDelete, newPods[int(desiredNewPods):]...)
 		newPods = newPods[:int(desiredNewPods)]
 	}
 
-	// Determine the number of new pods to create
-	if len(newPods) < int(desiredNewPods) {
-		podsToCreate = int(desiredNewPods) - len(newPods)
+	// Determine Pods to create
+	totalPods := len(oldPods) + len(newPods)
+	if totalPods < int(workload.Spec.Replicas) {
+		podsToCreate = int(workload.Spec.Replicas) - totalPods
 	}
 	log.Info("Reconciliation plan", "podsToDeleteCount", len(podsToDelete), "podsToCreateCount", podsToCreate)
 
-	// Execute the reconciliation plan
-	// Delete excess pods
+	// Step 7: Execute the reconciliation plan
+	// Delete Pods
 	for _, pod := range podsToDelete {
-		if err := r.Delete(ctx, &pod); err != nil {
-			if client.IgnoreNotFound(err) != nil {
-				log.Error(err, "Failed to delete Pod", "podName", pod.Name)
-				return fmt.Errorf("failed to delete Pod: %w", err)
-			}
+		if err := r.Delete(ctx, &pod); err != nil && !apierrors.IsNotFound(err) {
+			log.Error(err, "Failed to delete Pod", "podName", pod.Name)
+			return err
 		}
 		log.Info("Deleted Pod", "podName", pod.Name)
 	}
 
-	// Create new pods
+	// Create new Pods
 	for i := 0; i < podsToCreate; i++ {
 		newPod := corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				GenerateName: workload.Name + "-",
 				Namespace:    workload.Namespace,
 				Labels: map[string]string{
-					"partitionedworkload": workload.Name,
-					"pod-template-hash":   currentHash, // Add the current hash as a label
+					"partitionedworkload":      workload.Name,
+					"controller-revision-hash": currentRevision.Name,
 				},
 			},
 			Spec: corev1.PodSpec{
 				Containers: workload.Spec.PodTemplate.Containers,
 			},
 		}
-
-		// Set OwnerReference
 		if err := ctrl.SetControllerReference(workload, &newPod, r.Scheme); err != nil {
 			log.Error(err, "Failed to set OwnerReference for Pod")
-			return fmt.Errorf("failed to set OwnerReference: %w", err)
+			return err
 		}
-
 		if err := r.Create(ctx, &newPod); err != nil {
 			log.Error(err, "Failed to create new Pod")
-			return fmt.Errorf("failed to create new Pod: %w", err)
+			return err
 		}
 		log.Info("Created new Pod", "podName", newPod.Name)
-
-		// Add the newly created pod to the newPods list
-		newPods = append(newPods, newPod)
 	}
 
-	// Final check to ensure total pod count matches desired replicas
-	totalPods := len(oldPods) + len(newPods)
+	// Step 8: Final check
+	totalPods = len(oldPods) + len(newPods)
 	if totalPods != int(workload.Spec.Replicas) {
 		log.Error(nil, "Mismatch in total pod count after reconciliation", "expected", workload.Spec.Replicas, "actual", totalPods)
 		return fmt.Errorf("mismatch in total pod count: expected %d, got %d", workload.Spec.Replicas, totalPods)
@@ -202,14 +264,6 @@ func (r *PartitionedWorkloadReconciler) updateStatus(ctx context.Context, worklo
 
 	log.Info("Updated status", "availableReplicas", available)
 	return nil
-}
-
-// generatePodTemplateHash generates a truncated hash for the given PodTemplateSpec
-func generatePodTemplateHash(template workloadsv1.PodTemplateSpec) string {
-	hash := sha256.New()
-	hash.Write([]byte(fmt.Sprintf("%v", template)))
-	fullHash := hex.EncodeToString(hash.Sum(nil))
-	return fullHash[:16] // Truncate to the first 16 characters
 }
 
 // SetupWithManager sets up the controller with the Manager

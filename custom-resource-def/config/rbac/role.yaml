@@ -5,6 +5,17 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
+  - apps
+  resources:
+  - controllerrevisions
+  verbs:
+  - list
+  - watch
+  - get
+  - create
+  - update
+  - delete
+- apiGroups:
   - workloads.example.com
   resources:
   - partitionedworkloads
@@ -29,4 +40,15 @@ rules:
   verbs:
   - get
   - patch
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - delete
   - update
