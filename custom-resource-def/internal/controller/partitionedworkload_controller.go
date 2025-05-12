@@ -272,7 +272,6 @@ func (r *PartitionedWorkloadReconciler) ensureReplicasAndPartition(ctx context.C
 	}
 
 	// Create new Pods
-	// Modify the part of ensureReplicasAndPartition where it deserializes old templates
 
 	oldPodsToCreate := desiredOldPods - len(oldPods)
 	if oldPodsToCreate > 0 && len(oldRevisions) > 0 {
@@ -303,7 +302,7 @@ func (r *PartitionedWorkloadReconciler) ensureReplicasAndPartition(ctx context.C
 			oldTemplate = oldWorkload.Spec.PodTemplate
 		}
 
-		// Verify we have containers in the old template
+		// Verify containers in the old template
 		if len(oldTemplate.Containers) == 0 {
 			log.Error(nil, "Old template has no containers after attempted deserialization",
 				"revisionName", mostRecentOldRevision.Name,
@@ -340,7 +339,6 @@ func (r *PartitionedWorkloadReconciler) ensureReplicasAndPartition(ctx context.C
 			}
 
 			if validOldRevision == nil {
-				// If we still can't find a valid old revision, use the current template as fallback
 				log.Info("No valid old revision found, using current template as fallback")
 				oldTemplate = workload.Spec.PodTemplate
 			} else {
@@ -372,7 +370,6 @@ func (r *PartitionedWorkloadReconciler) ensureReplicasAndPartition(ctx context.C
 				Spec: corev1.PodSpec{
 					Containers: oldTemplate.Containers,
 					SecurityContext: &corev1.PodSecurityContext{
-						// Do not force RunAsNonRoot for nginx which needs to bind to privileged ports
 						SeccompProfile: &corev1.SeccompProfile{
 							Type: corev1.SeccompProfileTypeRuntimeDefault,
 						},
@@ -416,7 +413,6 @@ func (r *PartitionedWorkloadReconciler) ensureReplicasAndPartition(ctx context.C
 				Spec: corev1.PodSpec{
 					Containers: workload.Spec.PodTemplate.Containers,
 					SecurityContext: &corev1.PodSecurityContext{
-						// Do not force RunAsNonRoot for nginx which needs to bind to privileged ports
 						SeccompProfile: &corev1.SeccompProfile{
 							Type: corev1.SeccompProfileTypeRuntimeDefault,
 						},
