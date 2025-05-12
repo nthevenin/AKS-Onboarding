@@ -111,7 +111,14 @@ func (r *PartitionedWorkloadReconciler) ensureReplicasAndPartition(ctx context.C
 		}
 	}
 
-	log.Info("Identified revisions", "currentRevision", currentRevision.Name, "oldRevisionCount", len(oldRevisions))
+	// Logging the identified revisions
+	log.Info("Identified revisions", "currentRevision", func() string {
+		if currentRevision != nil {
+			return currentRevision.Name
+		}
+		return "nil"
+	}(), "oldRevisionCount", len(oldRevisions))
+
 	// Step 3: Create a new ControllerRevision if the PodTemplateSpec has changed
 	serializedTemplate, err := json.Marshal(workload.Spec.PodTemplate)
 	if err != nil {
@@ -144,53 +151,115 @@ func (r *PartitionedWorkloadReconciler) ensureReplicasAndPartition(ctx context.C
 			log.Error(err, "Failed to create ControllerRevision")
 			return err
 		}
+
+		// Insert the previous current revision into oldRevisions if it exists
+		if currentRevision != nil {
+			oldRevisions = append([]*appsv1.ControllerRevision{currentRevision}, oldRevisions...)
+		}
+
 		currentRevision = newRevision
 		log.Info("Created new ControllerRevision", "revision", currentRevision.Revision)
 	}
 
-	// Step 4: Categorize Pods by revision
-	var oldPods, newPods []corev1.Pod
+	// Step 4: Map pods to their revisions for better tracking
+	podsByRevision := make(map[string][]corev1.Pod)
+	var uncategorizedPods []corev1.Pod
+
+	// Create a hashmap of revisions for quick access
+	revisionMap := make(map[string]*appsv1.ControllerRevision)
+	if currentRevision != nil {
+		revisionMap[currentRevision.Name] = currentRevision
+	}
+	for _, rev := range oldRevisions {
+		revisionMap[rev.Name] = rev
+	}
+
+	// Categorize each pod by its revision
 	for _, pod := range pods.Items {
-		if pod.Labels["controller-revision-hash"] == currentRevision.Name {
-			newPods = append(newPods, pod)
-		} else {
-			for _, oldRev := range oldRevisions {
-				if pod.Labels["controller-revision-hash"] == oldRev.Name {
-					oldPods = append(oldPods, pod)
-					break
+		revHash, exists := pod.Labels["controller-revision-hash"]
+		if exists && revHash != "" {
+			if _, found := revisionMap[revHash]; found {
+				podsByRevision[revHash] = append(podsByRevision[revHash], pod)
+			} else {
+				// Important: Don't treat these pods as uncategorized if we're in a transition
+				// They might be from a previous revision that's still valid
+				if len(oldRevisions) > 0 {
+					// Try to associate with the newest old revision if possible
+					podsByRevision[oldRevisions[0].Name] = append(podsByRevision[oldRevisions[0].Name], pod)
+					log.Info("Reassigned pod to newest old revision",
+						"podName", pod.Name,
+						"originalRevision", revHash,
+						"newRevision", oldRevisions[0].Name)
+				} else {
+					uncategorizedPods = append(uncategorizedPods, pod)
 				}
+			}
+		} else {
+			uncategorizedPods = append(uncategorizedPods, pod)
+		}
+	}
+
+	// Only delete truly uncategorized pods - keep others during transition
+	if len(uncategorizedPods) > 0 {
+		log.Info("Found uncategorized pods", "count", len(uncategorizedPods))
+		for _, pod := range uncategorizedPods {
+			log.Info("Deleting uncategorized pod", "podName", pod.Name)
+			if err := r.Delete(ctx, &pod); err != nil && !apierrors.IsNotFound(err) {
+				log.Error(err, "Failed to delete uncategorized pod", "podName", pod.Name)
+				return err
 			}
 		}
 	}
-	log.Info("Categorized pods by ControllerRevision", "oldPodsCount", len(oldPods), "newPodsCount", len(newPods))
 
 	// Step 5: Calculate desired counts
-	desiredOldPods := workload.Spec.PartitionCount
-	desiredNewPods := workload.Spec.Replicas - desiredOldPods
+	desiredOldPods := int(workload.Spec.PartitionCount)
+	desiredNewPods := int(workload.Spec.Replicas - workload.Spec.PartitionCount)
 	log.Info("Calculated desired pod counts", "desiredOldPods", desiredOldPods, "desiredNewPods", desiredNewPods)
 
 	// Step 6: Reconciliation plan
 	var podsToDelete []corev1.Pod
-	podsToCreate := 0
+	var podsToRetain []corev1.Pod
 
-	// Retain the desired number of old Pods
-	if len(oldPods) > int(desiredOldPods) {
-		podsToDelete = append(podsToDelete, oldPods[int(desiredOldPods):]...)
-		oldPods = oldPods[:int(desiredOldPods)]
+	var currentPods []corev1.Pod
+	if currentRevision != nil {
+		currentPods = podsByRevision[currentRevision.Name]
 	}
 
-	// Delete excess new Pods
-	if len(newPods) > int(desiredNewPods) {
-		podsToDelete = append(podsToDelete, newPods[int(desiredNewPods):]...)
-		newPods = newPods[:int(desiredNewPods)]
+	// Collect older pods, sorted by revision (newest old revision first)
+	var oldPods []corev1.Pod
+	if len(oldRevisions) > 0 {
+		// Start with the newest old revision
+		for _, revision := range oldRevisions {
+			oldPods = append(oldPods, podsByRevision[revision.Name]...)
+		}
 	}
 
-	// Determine Pods to create
-	totalPods := len(oldPods) + len(newPods)
-	if totalPods < int(workload.Spec.Replicas) {
-		podsToCreate = int(workload.Spec.Replicas) - totalPods
+	// Keep the newest oldPods up to desiredOldPods count
+	if len(oldPods) > desiredOldPods {
+		// Keep the newest old pods (which are at the beginning of the slice)
+		podsToRetain = append(podsToRetain, oldPods[:desiredOldPods]...)
+		podsToDelete = append(podsToDelete, oldPods[desiredOldPods:]...)
+	} else {
+		podsToRetain = append(podsToRetain, oldPods...)
 	}
-	log.Info("Reconciliation plan", "podsToDeleteCount", len(podsToDelete), "podsToCreateCount", podsToCreate)
+
+	// Keep current pods up to the desiredNewPods count
+	if len(currentPods) > desiredNewPods {
+		podsToRetain = append(podsToRetain, currentPods[:desiredNewPods]...)
+		podsToDelete = append(podsToDelete, currentPods[desiredNewPods:]...)
+	} else {
+		podsToRetain = append(podsToRetain, currentPods...)
+	}
+
+	// Calculate how many pods we need to create
+	podsToCreate := desiredOldPods + desiredNewPods - len(podsToRetain)
+
+	log.Info("Reconciliation plan",
+		"podsToDeleteCount", len(podsToDelete),
+		"podsToRetainCount", len(podsToRetain),
+		"podsToCreateCount", podsToCreate,
+		"oldPodsAvailable", len(oldPods),
+		"currentPodsAvailable", len(currentPods))
 
 	// Step 7: Execute the reconciliation plan
 	// Delete Pods
@@ -203,39 +272,190 @@ func (r *PartitionedWorkloadReconciler) ensureReplicasAndPartition(ctx context.C
 	}
 
 	// Create new Pods
-	for i := 0; i < podsToCreate; i++ {
-		newPod := corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				GenerateName: workload.Name + "-",
-				Namespace:    workload.Namespace,
-				Labels: map[string]string{
-					"partitionedworkload":      workload.Name,
-					"controller-revision-hash": currentRevision.Name,
+	// Modify the part of ensureReplicasAndPartition where it deserializes old templates
+
+	oldPodsToCreate := desiredOldPods - len(oldPods)
+	if oldPodsToCreate > 0 && len(oldRevisions) > 0 {
+		// If we need more old pods and have old revisions, create them with the most recent old revision
+		mostRecentOldRevision := oldRevisions[0]
+
+		// Try to deserialize different formats
+		var oldTemplate workloadsv1.PodTemplateSpec
+
+		if err := json.Unmarshal(mostRecentOldRevision.Data.Raw, &oldTemplate); err != nil {
+			// Try to deserialize as a full PodTemplateSpec first
+			log.Error(err, "Failed to deserialize old PodTemplateSpec directly",
+				"revisionName", mostRecentOldRevision.Name)
+
+			// Try to deserialize as wrapped in another structure
+			var oldWorkload struct {
+				Spec struct {
+					PodTemplate workloadsv1.PodTemplateSpec `json:"podTemplate"`
+				} `json:"spec"`
+			}
+
+			if err := json.Unmarshal(mostRecentOldRevision.Data.Raw, &oldWorkload); err != nil {
+				log.Error(err, "Failed to deserialize old PodTemplateSpec as wrapped structure",
+					"revisionName", mostRecentOldRevision.Name)
+				return err
+			}
+
+			oldTemplate = oldWorkload.Spec.PodTemplate
+		}
+
+		// Verify we have containers in the old template
+		if len(oldTemplate.Containers) == 0 {
+			log.Error(nil, "Old template has no containers after attempted deserialization",
+				"revisionName", mostRecentOldRevision.Name,
+				"rawData", string(mostRecentOldRevision.Data.Raw))
+
+			// Try to find any valid old revision with containers
+			var validOldRevision *appsv1.ControllerRevision
+			for _, revision := range oldRevisions {
+				var testTemplate workloadsv1.PodTemplateSpec
+				if err := json.Unmarshal(revision.Data.Raw, &testTemplate); err == nil && len(testTemplate.Containers) > 0 {
+					validOldRevision = revision
+					oldTemplate = testTemplate
+					log.Info("Found valid old revision with containers",
+						"revisionName", validOldRevision.Name,
+						"containerCount", len(oldTemplate.Containers))
+					break
+				}
+
+				// Try the wrapped structure
+				var oldWorkload struct {
+					Spec struct {
+						PodTemplate workloadsv1.PodTemplateSpec `json:"podTemplate"`
+					} `json:"spec"`
+				}
+				if err := json.Unmarshal(revision.Data.Raw, &oldWorkload); err == nil &&
+					len(oldWorkload.Spec.PodTemplate.Containers) > 0 {
+					validOldRevision = revision
+					oldTemplate = oldWorkload.Spec.PodTemplate
+					log.Info("Found valid old revision with containers in wrapped structure",
+						"revisionName", validOldRevision.Name,
+						"containerCount", len(oldTemplate.Containers))
+					break
+				}
+			}
+
+			if validOldRevision == nil {
+				// If we still can't find a valid old revision, use the current template as fallback
+				log.Info("No valid old revision found, using current template as fallback")
+				oldTemplate = workload.Spec.PodTemplate
+			} else {
+				mostRecentOldRevision = validOldRevision
+			}
+		}
+
+		log.Info("Creating new pods with old revision",
+			"revisionName", mostRecentOldRevision.Name,
+			"containerCount", len(oldTemplate.Containers),
+			"containerImage", func() string {
+				if len(oldTemplate.Containers) > 0 {
+					return oldTemplate.Containers[0].Image
+				}
+				return "unknown"
+			}(),
+			"count", oldPodsToCreate)
+
+		for i := 0; i < oldPodsToCreate; i++ {
+			newPod := corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: workload.Name + "-",
+					Namespace:    workload.Namespace,
+					Labels: map[string]string{
+						"partitionedworkload":      workload.Name,
+						"controller-revision-hash": mostRecentOldRevision.Name,
+					},
 				},
-			},
-			Spec: corev1.PodSpec{
-				Containers: workload.Spec.PodTemplate.Containers,
-			},
+				Spec: corev1.PodSpec{
+					Containers: oldTemplate.Containers,
+					SecurityContext: &corev1.PodSecurityContext{
+						// Do not force RunAsNonRoot for nginx which needs to bind to privileged ports
+						SeccompProfile: &corev1.SeccompProfile{
+							Type: corev1.SeccompProfileTypeRuntimeDefault,
+						},
+					},
+				},
+			}
+
+			if err := ctrl.SetControllerReference(workload, &newPod, r.Scheme); err != nil {
+				log.Error(err, "Failed to set OwnerReference for Pod")
+				return err
+			}
+			if err := r.Create(ctx, &newPod); err != nil {
+				log.Error(err, "Failed to create new Pod with old revision",
+					"revisionName", mostRecentOldRevision.Name)
+				return err
+			}
+			log.Info("Created new Pod with old revision",
+				"podName", newPod.Name,
+				"revisionName", mostRecentOldRevision.Name)
 		}
-		if err := ctrl.SetControllerReference(workload, &newPod, r.Scheme); err != nil {
-			log.Error(err, "Failed to set OwnerReference for Pod")
-			return err
-		}
-		if err := r.Create(ctx, &newPod); err != nil {
-			log.Error(err, "Failed to create new Pod")
-			return err
-		}
-		log.Info("Created new Pod", "podName", newPod.Name)
 	}
 
-	// Step 8: Final check
-	totalPods = len(oldPods) + len(newPods)
-	if totalPods != int(workload.Spec.Replicas) {
-		log.Error(nil, "Mismatch in total pod count after reconciliation", "expected", workload.Spec.Replicas, "actual", totalPods)
-		return fmt.Errorf("mismatch in total pod count: expected %d, got %d", workload.Spec.Replicas, totalPods)
+	newPodsToCreate := desiredNewPods - len(currentPods)
+	if newPodsToCreate > 0 && currentRevision != nil {
+		// Create pods with the current revision
+		log.Info("Creating new pods with current revision",
+			"revisionName", currentRevision.Name,
+			"containerImage", workload.Spec.PodTemplate.Containers[0].Image,
+			"count", newPodsToCreate)
+
+		for i := 0; i < newPodsToCreate; i++ {
+			newPod := corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: workload.Name + "-",
+					Namespace:    workload.Namespace,
+					Labels: map[string]string{
+						"partitionedworkload":      workload.Name,
+						"controller-revision-hash": currentRevision.Name,
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: workload.Spec.PodTemplate.Containers,
+					SecurityContext: &corev1.PodSecurityContext{
+						// Do not force RunAsNonRoot for nginx which needs to bind to privileged ports
+						SeccompProfile: &corev1.SeccompProfile{
+							Type: corev1.SeccompProfileTypeRuntimeDefault,
+						},
+					},
+				},
+			}
+
+			if err := ctrl.SetControllerReference(workload, &newPod, r.Scheme); err != nil {
+				log.Error(err, "Failed to set OwnerReference for Pod")
+				return err
+			}
+			if err := r.Create(ctx, &newPod); err != nil {
+				log.Error(err, "Failed to create new Pod")
+				return err
+			}
+			log.Info("Created new Pod", "podName", newPod.Name)
+		}
 	}
 
-	log.Info("Reconciliation complete", "totalPods", totalPods, "desiredOldPods", desiredOldPods, "desiredNewPods", desiredNewPods)
+	// Step 8: Final validation
+	// Recount pods to ensure we have the correct amount
+	var finalPods corev1.PodList
+	if err := r.List(ctx, &finalPods, client.InNamespace(workload.Namespace), client.MatchingLabels{
+		"partitionedworkload": workload.Name,
+	}); err != nil {
+		log.Error(err, "Failed to list Pods for final validation")
+		return err
+	}
+
+	if len(finalPods.Items) != int(workload.Spec.Replicas) {
+		log.Error(nil, "Mismatch in total pod count after reconciliation",
+			"expected", workload.Spec.Replicas, "actual", len(finalPods.Items))
+		// Adding retry mechanism in case of mismatch
+		return fmt.Errorf("mismatch in total pod count: expected %d, got %d",
+			workload.Spec.Replicas, len(finalPods.Items))
+	} else {
+		log.Info("Reconciliation successful - pod count matches desired replicas", "podCount", len(finalPods.Items))
+	}
+
 	return nil
 }
 
