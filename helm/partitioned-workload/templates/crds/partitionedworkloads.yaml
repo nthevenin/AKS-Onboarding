@@ -1,0 +1,98 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: partitionedworkloads.workloads.example.com
+  annotations:
+    # Best practice: Install CRDs before other resources
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation
+    helm.sh/resource-policy: keep
+spec:
+  group: workloads.example.com
+  names:
+    kind: PartitionedWorkload
+    listKind: PartitionedWorkloadList
+    plural: partitionedworkloads
+    singular: partitionedworkload
+    shortNames:
+    - pw
+  scope: Namespaced
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        description: PartitionedWorkload manages a set of pods with partition-based rolling updates
+        type: object
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+          spec:
+            type: object
+            required:
+            - replicas
+            - podTemplate
+            properties:
+              replicas:
+                description: Number of desired pods
+                type: integer
+                minimum: 0
+              partitionCount:
+                description: Number of pods to keep at the old version during updates
+                type: integer
+                minimum: 0
+              podTemplate:
+                description: Template for pods
+                type: object
+                required:
+                - containers
+                properties:
+                  containers:
+                    type: array
+                    items:
+                      type: object
+                      required:
+                      - name
+                      - image
+                      properties:
+                        name:
+                          type: string
+                        image:
+                          type: string
+                        ports:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              containerPort:
+                                type: integer
+                              protocol:
+                                type: string
+                        resources:
+                          type: object
+          status:
+            type: object
+            properties:
+              availableReplicas:
+                type: integer
+    subresources:
+      status: {}
+    additionalPrinterColumns:
+    - name: Replicas
+      type: integer
+      jsonPath: .spec.replicas
+    - name: PartitionCount
+      type: integer
+      jsonPath: .spec.partitionCount
+    - name: Available
+      type: integer
+      jsonPath: .status.availableReplicas
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp

@@ -1,0 +1,15 @@
+{{- if .Values.createSampleCR }}
+apiVersion: workloads.example.com/v1
+kind: PartitionedWorkload
+metadata:
+  name: sample-workload
+spec:
+  replicas: 5
+  partitionCount: 2
+  podTemplate:
+    containers:
+    - name: nginx
+      image: nginx:stable
+      ports:
+      - containerPort: 80
+{{- end }}

@@ -1,0 +1,87 @@
+# Values for partitioned-workload controller
+replicaCount: 1
+
+image:
+  repository: partitionedworkloadacr.azurecr.io/partitioned-workload-controller
+  pullPolicy: IfNotPresent
+  tag: "v1.0.0"
+
+# Azure specific settings
+azureIdentity:
+  enabled: false
+  # Uncomment and set these if using AAD Pod Identity
+  # clientID: ""
+  # resourceID: ""
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# Pod assigned identity for AKS workload identity (recommended over AAD Pod Identity)
+workloadIdentity:
+  enabled: false
+  # clientID: ""  # Azure AD application client ID
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  # If using workload identity with AKS, add this annotation
+  # annotations:
+  #   azure.workload.identity/client-id: "<client-id>"
+  name: ""
+  automount: true  # Added this line for serviceaccount.yaml
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRootFilesystem: true
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# Azure recommended node selectors
+nodeSelector: {}
+  # "kubernetes.io/os": linux
+  # For AKS system node pools (recommended for operators)
+  # "kubernetes.azure.com/mode": system
+
+# Azure recommended affinity rules
+affinity: {}
+  # podAntiAffinity:
+  #   preferredDuringSchedulingIgnoredDuringExecution:
+  #   - weight: 100
+  #     podAffinityTerm:
+  #       labelSelector:
+  #         matchExpressions:
+  #         - key: app.kubernetes.io/name
+  #           operator: In
+  #           values:
+  #           - partitioned-workload
+  #       topologyKey: kubernetes.io/hostname
+
+# For AKS, tolerate system node taints for critical controllers
+tolerations: []
+  # - key: "CriticalAddonsOnly"
+  #   operator: "Exists"
+  #   effect: "NoSchedule"
+
+# Create a sample CR for testing
+createSampleCR: false
+namespaceOverride: "partitioned-workload-system"
+createNamespace: true
